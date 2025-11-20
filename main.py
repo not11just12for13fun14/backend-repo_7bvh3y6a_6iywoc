@@ -27,6 +27,22 @@ class WatchItemIn(BaseModel):
     user_id: str
     symbol: str
     name: Optional[str] = None
+    watchlist_id: Optional[str] = None
+    group: Optional[str] = None
+
+class WatchlistIn(BaseModel):
+    user_id: str
+    name: str
+
+class OrderIn(BaseModel):
+    user_id: str
+    symbol: str
+    side: str
+    quantity: float
+    price: float
+
+class OrderUpdate(BaseModel):
+    status: str
 
 @app.get("/")
 def read_root():
@@ -63,6 +79,7 @@ def test_database():
 # --- Market Data Helpers ---
 # We'll use a free public source for demo (Yahoo Finance unofficial JSON)
 YF_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbols}"
+YF_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval}&range={range}"
 
 
 def fetch_quotes(symbols: List[str]) -> List[QuoteResponse]:
@@ -117,27 +134,144 @@ def search_symbol(q: str):
     ]
     return {"results": results}
 
+# --- Watchlists & Groups ---
 @app.post("/api/watchlist")
 def add_watchlist(item: WatchItemIn):
     try:
         from schemas import Watchitem
-        doc = Watchitem(user_id=item.user_id, symbol=item.symbol.upper(), name=item.name)
+        doc = Watchitem(user_id=item.user_id, symbol=item.symbol.upper(), name=item.name, watchlist_id=item.watchlist_id, group=item.group)
         inserted_id = create_document("watchitem", doc)
         return {"id": inserted_id, "message": "Added to watchlist"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/watchlist")
-def get_watchlist(user_id: str):
+def get_watchlist(user_id: str, watchlist_id: Optional[str] = None, group: Optional[str] = None):
     try:
-        items = get_documents("watchitem", {"user_id": user_id})
-        # clean ObjectId
+        filt = {"user_id": user_id}
+        if watchlist_id:
+            filt["watchlist_id"] = watchlist_id
+        if group:
+            filt["group"] = group
+        items = get_documents("watchitem", filt)
         for it in items:
             it["_id"] = str(it.get("_id"))
         return {"items": items}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/watchlists")
+def create_watchlist(w: WatchlistIn):
+    try:
+        from schemas import Watchlist
+        wid = create_document("watchlist", Watchlist(user_id=w.user_id, name=w.name))
+        return {"id": wid, "message": "Watchlist created"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/watchlists")
+def list_watchlists(user_id: str):
+    try:
+        lists = get_documents("watchlist", {"user_id": user_id})
+        for it in lists:
+            it["_id"] = str(it.get("_id"))
+        return {"items": lists}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- Charts: Intraday & Historical OHLC ---
+@app.get("/api/chart/intraday")
+def intraday(symbol: str, interval: str = "1m", range: str = "1d"):
+    try:
+        url = YF_CHART_URL.replace("{symbol}", symbol).replace("{interval}", interval).replace("{range}", range)
+        r = requests.get(url, timeout=10)
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail="Chart fetch failed")
+        data = r.json().get("chart", {})
+        result = (data.get("result") or [])[0]
+        timestamps = result.get("timestamp", [])
+        indicators = result.get("indicators", {})
+        ohlc = indicators.get("quote", [{}])[0]
+        opens = ohlc.get("open", [])
+        highs = ohlc.get("high", [])
+        lows = ohlc.get("low", [])
+        closes = ohlc.get("close", [])
+        series = []
+        for i, t in enumerate(timestamps):
+            try:
+                series.append({
+                    "t": t,
+                    "o": opens[i],
+                    "h": highs[i],
+                    "l": lows[i],
+                    "c": closes[i]
+                })
+            except Exception:
+                continue
+        return {"symbol": symbol.upper(), "interval": interval, "range": range, "series": series}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/chart/historical")
+def historical(symbol: str, interval: str = "1d", range: str = "1y"):
+    return intraday(symbol=symbol, interval=interval, range=range)
+
+# --- Paper Trading Orders & Positions ---
+@app.post("/api/orders")
+def create_order(o: OrderIn):
+    try:
+        from schemas import Order
+        # For demo, we immediately mark filled at the given price
+        oid = create_document("order", Order(user_id=o.user_id, symbol=o.symbol.upper(), side=o.side, quantity=o.quantity, price=o.price, status='filled'))
+        return {"id": oid, "message": "Order placed"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/orders")
+def list_orders(user_id: str):
+    try:
+        orders = get_documents("order", {"user_id": user_id})
+        for it in orders:
+            it["_id"] = str(it.get("_id"))
+        return {"items": orders}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/positions")
+def positions(user_id: str):
+    """Aggregate filled orders into net positions and P&L"""
+    try:
+        orders = get_documents("order", {"user_id": user_id, "status": "filled"})
+        # Aggregate by symbol
+        agg = {}
+        for o in orders:
+            sym = o.get("symbol").upper()
+            qty = float(o.get("quantity", 0)) * (1 if o.get("side") == "buy" else -1)
+            cost = float(o.get("price", 0)) * float(o.get("quantity", 0)) * (1 if o.get("side") == "buy" else -1)
+            if sym not in agg:
+                agg[sym] = {"symbol": sym, "qty": 0.0, "cost": 0.0}
+            agg[sym]["qty"] += qty
+            agg[sym]["cost"] += cost
+        symbols = list(agg.keys())
+        quotes = fetch_quotes(symbols) if symbols else []
+        qmap = {q.symbol: q for q in quotes}
+        positions = []
+        for sym, a in agg.items():
+            qty = a["qty"]
+            avg_cost = (a["cost"] / abs(a["qty"])) if a["qty"] != 0 else 0.0
+            mkt = qmap.get(sym)
+            last = float(mkt.price) if mkt else 0.0
+            pnl = (last - avg_cost) * qty
+            positions.append({
+                "symbol": sym,
+                "quantity": qty,
+                "avg_price": round(avg_cost, 4),
+                "last": last,
+                "unrealized_pnl": round(pnl, 2)
+            })
+        return {"items": positions}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
